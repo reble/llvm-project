@@ -751,6 +751,8 @@ void AMDGPUSwLowerLDS::poisonRedzones(Function *Func, Value *MallocPtr) {
   FunctionCallee AsanPoisonRegion = M.getOrInsertFunction(
       "__asan_poison_region",
       FunctionType::get(VoidTy, {Int64Ty, Int64Ty}, false));
+  if (Function *F = dyn_cast<Function>(AsanPoisonRegion.getCallee()))
+    F->addFnAttr("amdgpu-agpr-alloc", "0");
 
   auto RedzonesVec = LDSParams.RedzoneOffsetAndSizeVector;
   size_t VecSize = RedzonesVec.size();
@@ -887,6 +889,8 @@ void AMDGPUSwLowerLDS::lowerKernelLDSAccesses(Function *Func,
   FunctionCallee MallocFunc = M.getOrInsertFunction(
       StringRef("__asan_malloc_impl"),
       FunctionType::get(Int64Ty, {Int64Ty, Int64Ty}, false));
+  if (Function *F = dyn_cast<Function>(MallocFunc.getCallee()))
+    F->addFnAttr("amdgpu-agpr-alloc", "0");
   Value *RAPtrToInt = IRB.CreatePtrToInt(ReturnAddress, Int64Ty);
   Value *MallocCall = IRB.CreateCall(MallocFunc, {CurrMallocSize, RAPtrToInt});
 
@@ -948,6 +952,8 @@ void AMDGPUSwLowerLDS::lowerKernelLDSAccesses(Function *Func,
   FunctionCallee AsanFreeFunc = M.getOrInsertFunction(
       StringRef("__asan_free_impl"),
       FunctionType::get(IRB.getVoidTy(), {Int64Ty, Int64Ty}, false));
+  if (Function *F = dyn_cast<Function>(AsanFreeFunc.getCallee()))
+    F->addFnAttr("amdgpu-agpr-alloc", "0");
   Value *ReturnAddr = IRB.CreateIntrinsic(
       Intrinsic::returnaddress, IRB.getPtrTy(DL.getProgramAddressSpace()),
       IRB.getInt32(0));
