@@ -22,6 +22,7 @@
 #include "llvm/ADT/MapVector.h"
 #include "llvm/ADT/SetVector.h"
 #include "llvm/ADT/SmallVector.h"
+#include "llvm/Analysis/UniformityAnalysis.h"
 #include "llvm/IR/PassManager.h"
 
 namespace llvm {
@@ -71,6 +72,7 @@ struct SLPVectorizerPass : public OptionalPassInfoMixin<SLPVectorizerPass> {
   AssumptionCache *AC = nullptr;
   DemandedBits *DB = nullptr;
   const DataLayout *DL = nullptr;
+  const UniformityInfo *UA = nullptr;
 
 public:
   LLVM_ABI PreservedAnalyses run(Function &F, FunctionAnalysisManager &AM);
@@ -80,7 +82,8 @@ public:
                         TargetTransformInfo *TTI_, TargetLibraryInfo *TLI_,
                         AAResults *AA_, LoopInfo *LI_, DominatorTree *DT_,
                         AssumptionCache *AC_, DemandedBits *DB_,
-                        OptimizationRemarkEmitter *ORE_);
+                        OptimizationRemarkEmitter *ORE_,
+                        const UniformityInfo *UA_ = nullptr);
 
 private:
   /// Collect store and getelementptr instructions and organize them

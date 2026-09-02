@@ -612,6 +612,10 @@ public:
   }
 
   virtual unsigned getNumberOfRegisters(unsigned ClassID) const { return 8; }
+  virtual unsigned getVectorRegisterBudgetForSLP(unsigned ClassID,
+                                                 const Function &F) const {
+    return getNumberOfRegisters(ClassID);
+  }
   virtual bool hasConditionalLoadStoreForType(Type *Ty, bool IsStore) const {
     return false;
   }

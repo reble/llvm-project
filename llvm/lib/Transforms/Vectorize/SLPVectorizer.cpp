@@ -51,6 +51,7 @@
 #include "llvm/Analysis/ScalarEvolutionExpressions.h"
 #include "llvm/Analysis/TargetLibraryInfo.h"
 #include "llvm/Analysis/TargetTransformInfo.h"
+#include "llvm/Analysis/UniformityAnalysis.h"
 #include "llvm/Analysis/ValueTracking.h"
 #include "llvm/Analysis/VectorUtils.h"
 #include "llvm/IR/Attributes.h"
@@ -299,6 +300,35 @@ static cl::opt<unsigned> LoopAwareTripCount(
     "slp-cost-loop-trip-count", cl::init(2), cl::Hidden,
     cl::desc("Loop trip count, considered by the cost model during "
              "modeling (0=loops are ignored and considered flat code)"));
+
+/// Caps the loop-nest trip-count multiplier (see getLoopNestScale()) so it
+/// can't outweigh register pressure on deeply-nested loops.
+static cl::opt<unsigned> SLPMaxLoopTripScale(
+    "slp-max-loop-trip-scale", cl::init(0), cl::Hidden,
+    cl::desc("Cap the loop-nest trip-count cost multiplier at this value "
+             "(0 = uncapped, existing behavior)"));
+
+/// Folds a tree-wide register-pressure spill-cost estimate into the tree
+/// cost; see computeTreeRegisterPressure(). Opt-in pending validation.
+static cl::opt<bool> SLPConsiderRegisterPressure(
+    "slp-consider-register-pressure", cl::init(false), cl::Hidden,
+    cl::desc("Fold a tree-wide simultaneous-register-pressure spill-cost "
+             "estimate into SLP's tree cost"));
+
+/// Also prices surrounding non-SLP scalar liveness into the pressure
+/// estimate; no-op without -slp-consider-register-pressure.
+static cl::opt<bool> SLPRegisterPressureScalarBB(
+    "slp-register-pressure-include-scalar-bb", cl::init(false), cl::Hidden,
+    cl::desc("Also price surrounding non-SLP scalar instruction liveness "
+             "into the tree register-pressure estimate (requires "
+             "-slp-consider-register-pressure)"));
+
+/// Limits the size of basic blocks scanned for surrounding scalar
+/// register-pressure candidates. 0 = unlimited.
+static cl::opt<unsigned> SLPRegisterPressureScalarScanBudget(
+    "slp-register-pressure-scan-budget", cl::init(10000), cl::Hidden,
+    cl::desc("Limit the size of basic blocks scanned for surrounding scalar "
+             "register pressure"));
 
 /// Refine the loop-aware cost scaling of gather/buildvector tree entries by
 /// using the per-lane execution scale of the operand that feeds each lane,
@@ -684,10 +714,11 @@ public:
   BoUpSLP(Function *Func, ScalarEvolution *Se, TargetTransformInfo *Tti,
           TargetLibraryInfo *TLi, AAResults *Aa, LoopInfo *Li,
           DominatorTree *Dt, AssumptionCache *AC, DemandedBits *DB,
-          const DataLayout *DL, OptimizationRemarkEmitter *ORE)
+          const DataLayout *DL, OptimizationRemarkEmitter *ORE,
+          const UniformityInfo *UA = nullptr)
       : BatchAA(*Aa), F(Func), SE(Se), TTI(Tti), TLI(TLi), LI(Li), DT(Dt),
         AC(AC), DB(DB), DL(DL), ORE(ORE), CostKind(getSLPCostKind(Func)),
-        Builder(Se->getContext(), TargetFolder(*DL)) {
+        UA(UA), Builder(Se->getContext(), TargetFolder(*DL)) {
     CodeMetrics::collectEphemeralValues(F, AC, EphValues);
     // Use the vector register size specified by the target unless overridden
     // by a command-line option.
@@ -2779,6 +2810,35 @@ private:
   getVectorSpillReloadCost(const TreeEntry *E, Type *ScalarTy, Type *VecTy,
                            Type *FinalVecTy,
                            const TTI::TargetCostKind CostKind) const;
+
+  /// A candidate divergent scalar found scanning a block for surrounding
+  /// (non-SLP) register pressure; see getOrComputeScalarLiveness().
+  struct ScalarLiveRange {
+    Instruction *I;
+    /// Last same-block user in program order, or \p I itself if none.
+    /// Ignored when EscapesBB is set.
+    Instruction *LastLocalUser;
+    /// True if some user is outside this block, so liveness can't be
+    /// bounded locally.
+    bool EscapesBB;
+  };
+
+  /// Per-block cache of ScalarLiveRange candidates, reused across every
+  /// tree-build attempt in the function. std::nullopt means the block hit
+  /// the scan budget; treated as "no data" rather than re-scanned.
+  DenseMap<BasicBlock *, std::optional<SmallVector<ScalarLiveRange, 8>>>
+      ScalarLivenessCache;
+
+  /// Lazily computes (or fetches from cache) the divergent scalar
+  /// register-pressure candidates for \p BB.
+  ArrayRef<ScalarLiveRange> getOrComputeScalarLiveness(BasicBlock *BB);
+
+  /// Estimates peak simultaneous vector-register pressure, per register
+  /// class, across the whole VectorizableTree via an interval sweep
+  /// (mirrors llvm::calculateRegisterUsageForPlan for the loop vectorizer).
+  /// With -slp-register-pressure-include-scalar-bb, also merges in
+  /// surrounding divergent scalar liveness from getOrComputeScalarLiveness().
+  SmallDenseMap<unsigned, unsigned> computeTreeRegisterPressure();
 
   /// This is the recursive part of buildTree.
   void buildTreeRec(ArrayRef<Value *> Roots, unsigned Depth, const EdgeInfo &EI,
@@ -5603,6 +5663,7 @@ private:
   /// Cached cost-model mode for this function.
   /// If -Os/-Oz, use CodeSize. Otherwise use RecipThroughput.
   const TargetTransformInfo::TargetCostKind CostKind;
+  const UniformityInfo *UA;
 
   unsigned MaxVecRegSize; // This is set by TTI or overridden by cl::opt.
   unsigned MinVecRegSize; // Set by cl::opt (default: 128).
@@ -16770,6 +16831,8 @@ uint64_t BoUpSLP::getLoopNestScale(const Loop *L) {
   for (const Loop *Cur : reverse(Chain)) {
     uint64_t TC = std::max<uint64_t>(1, getLoopTripCount(Cur, *SE));
     Scale = SaturatingMultiply(Scale, TC);
+    if (SLPMaxLoopTripScale != 0)
+      Scale = std::min<uint64_t>(Scale, SLPMaxLoopTripScale);
     LoopNestScaleCache.try_emplace(Cur, std::max<uint64_t>(1, Scale));
   }
   return std::max<uint64_t>(1, Scale);
@@ -16960,6 +17023,219 @@ BoUpSLP::getVectorSpillReloadCost(const TreeEntry *E, Type *ScalarTy,
     SpillsReloads += SingleRegSpillReload * SpillCount;
   }
   return SpillsReloads;
+}
+
+ArrayRef<BoUpSLP::ScalarLiveRange>
+BoUpSLP::getOrComputeScalarLiveness(BasicBlock *BB) {
+  auto CacheIt = ScalarLivenessCache.find(BB);
+  if (CacheIt != ScalarLivenessCache.end())
+    return CacheIt->second ? ArrayRef<ScalarLiveRange>(*CacheIt->second)
+                           : ArrayRef<ScalarLiveRange>();
+
+  if (SLPRegisterPressureScalarScanBudget != 0 &&
+      BB->size() > SLPRegisterPressureScalarScanBudget) {
+    ScalarLivenessCache.try_emplace(BB, std::nullopt);
+    return {};
+  }
+
+  SmallVector<ScalarLiveRange, 8> Ranges;
+  for (Instruction &I : *BB) {
+    if (I.isTerminator() || I.getType()->isVoidTy() || I.use_empty())
+      continue;
+    if (!UA || UA->isUniformAtDef(&I))
+      continue;
+    Instruction *LastLocalUser = &I;
+    bool Escapes = false;
+    for (const User *U : I.users()) {
+      const auto *UI = dyn_cast<Instruction>(U);
+      if (!UI || UI->getParent() != BB) {
+        Escapes = true;
+        break;
+      }
+      if (LastLocalUser->comesBefore(UI))
+        LastLocalUser = const_cast<Instruction *>(UI);
+    }
+    Ranges.push_back({&I, Escapes ? nullptr : LastLocalUser, Escapes});
+  }
+  auto [It, Inserted] = ScalarLivenessCache.try_emplace(BB, std::move(Ranges));
+  (void)Inserted;
+  return ArrayRef<ScalarLiveRange>(*It->second);
+}
+
+SmallDenseMap<unsigned, unsigned> BoUpSLP::computeTreeRegisterPressure() {
+  SmallDenseMap<unsigned, unsigned> MaxLocalUsers;
+  if (VectorizableTree.empty() || VectorizableTree.front()->isGather())
+    return MaxLocalUsers;
+
+  // Only entries with a well-defined vectorized result footprint.
+  SmallVector<TreeEntry *> LiveEntries;
+  SmallDenseMap<const TreeEntry *, Instruction *> LastInst;
+  for (const std::unique_ptr<TreeEntry> &TE : VectorizableTree) {
+    if (TE->isGather() || TE->State == TreeEntry::SplitVectorize ||
+        TE->State == TreeEntry::CombinedVectorize)
+      continue;
+    LastInst.try_emplace(TE.get(), &getLastInstructionInBundle(TE.get()));
+    LiveEntries.push_back(TE.get());
+  }
+  if (LiveEntries.empty())
+    return MaxLocalUsers;
+
+  // Combined live-range item: a tree entry, or (with
+  // -slp-register-pressure-include-scalar-bb) a non-tree-owned surrounding
+  // scalar competing for the same VGPR file.
+  struct PressureItem {
+    TreeEntry *TE = nullptr;
+    Instruction *ScalarInst = nullptr;
+    Instruction *PosInst = nullptr;
+    Instruction *LastLocalUser = nullptr;
+    bool EscapesBB = false;
+  };
+  SmallVector<PressureItem> Items;
+  Items.reserve(LiveEntries.size());
+  for (TreeEntry *TE : LiveEntries) {
+    PressureItem PI;
+    PI.TE = TE;
+    PI.PosInst = LastInst.lookup(TE);
+    Items.push_back(PI);
+  }
+
+  if (SLPRegisterPressureScalarBB) {
+    SmallPtrSet<BasicBlock *, 8> TouchedBBs;
+    for (TreeEntry *TE : LiveEntries)
+      TouchedBBs.insert(LastInst.lookup(TE)->getParent());
+    for (BasicBlock *BB : TouchedBBs) {
+      for (const ScalarLiveRange &SLR : getOrComputeScalarLiveness(BB)) {
+        // Skip candidates since vectorized (tree-owned) or detached as a
+        // dead operand (removeInstructionsAndOperands() unlinks eagerly,
+        // erases lazily).
+        if (!SLR.I->getParent() || !getTreeEntries(SLR.I).empty())
+          continue;
+        PressureItem PI;
+        PI.ScalarInst = SLR.I;
+        PI.PosInst = SLR.I;
+        PI.LastLocalUser = SLR.LastLocalUser;
+        PI.EscapesBB = SLR.EscapesBB;
+        Items.push_back(PI);
+      }
+    }
+  }
+
+  // Order by real IR position (closer to program order than tree-build
+  // Idx). comesBefore is same-block only, so precompute a BB order map
+  // for cross-block comparisons.
+  DenseMap<const BasicBlock *, unsigned> BBOrder;
+  for (const BasicBlock &BB : *F)
+    BBOrder.try_emplace(&BB, BBOrder.size());
+  stable_sort(Items, [&](const PressureItem &A, const PressureItem &B) {
+    Instruction *IA = A.PosInst;
+    Instruction *IB = B.PosInst;
+    if (IA == IB)
+      return false;
+    if (IA->getParent() != IB->getParent())
+      return BBOrder.lookup(IA->getParent()) < BBOrder.lookup(IB->getParent());
+    return IA->comesBefore(IB);
+  });
+
+  SmallDenseMap<const TreeEntry *, unsigned> PosOf;
+  SmallDenseMap<const Instruction *, unsigned> ScalarPosOf;
+  for (auto [Idx, Item] : enumerate(Items)) {
+    if (Item.TE)
+      PosOf[Item.TE] = Idx;
+    else
+      ScalarPosOf[Item.ScalarInst] = Idx;
+  }
+
+  // Death position: index of the last in-tree/in-scope consumer. Items
+  // with no trackable consumer stay conservatively live to the end.
+  const unsigned EndPos = Items.size() - 1;
+  SmallVector<unsigned> DeathPos(Items.size(), EndPos);
+  for (auto [Idx, Item] : enumerate(Items)) {
+    if (Item.TE) {
+      if (!Item.TE->UserTreeIndex)
+        continue;
+      auto UserPosIt = PosOf.find(Item.TE->UserTreeIndex.UserTE);
+      if (UserPosIt == PosOf.end())
+        continue;
+      DeathPos[Idx] = UserPosIt->second;
+      continue;
+    }
+    if (Item.EscapesBB || !Item.LastLocalUser)
+      continue;
+    if (Item.LastLocalUser == Item.ScalarInst) {
+      DeathPos[Idx] = Idx;
+      continue;
+    }
+    if (auto ScalarIt = ScalarPosOf.find(Item.LastLocalUser);
+        ScalarIt != ScalarPosOf.end()) {
+      DeathPos[Idx] = ScalarIt->second;
+      continue;
+    }
+    bool Found = false;
+    unsigned BestPos = Idx;
+    for (const TreeEntry *UserTE : getTreeEntries(Item.LastLocalUser)) {
+      auto UserPosIt = PosOf.find(UserTE);
+      if (UserPosIt == PosOf.end())
+        continue;
+      Found = true;
+      BestPos = std::max(BestPos, UserPosIt->second);
+    }
+    if (Found)
+      DeathPos[Idx] = BestPos;
+    // else: last local user isn't tracked; leave the EndPos default.
+  }
+  SmallDenseMap<unsigned, SmallVector<unsigned, 4>> DeathsAt;
+  for (auto [Idx, D] : enumerate(DeathPos))
+    DeathsAt[D].push_back(Idx);
+
+  // Register-class + parts for a tree entry's vectorized result, mirroring
+  // getVectorSpillReloadCost.
+  auto GetOwnFootprint =
+      [&](const TreeEntry *TE) -> std::optional<std::pair<unsigned, unsigned>> {
+    Type *ScalarTy = getValueType(TE->Scalars.front());
+    auto BWIt = MinBWs.find(TE);
+    if (BWIt != MinBWs.end()) {
+      auto *VTy = dyn_cast<FixedVectorType>(ScalarTy);
+      ScalarTy = IntegerType::get(F->getContext(), BWIt->second.first);
+      if (VTy)
+        ScalarTy = getWidenedType(ScalarTy, VTy->getNumElements());
+    }
+    Type *VecTy = getWidenedType(ScalarTy, TE->getVectorFactor());
+    const unsigned Parts = ::getNumberOfParts(*TTI, VecTy, ScalarTy);
+    if (Parts == 0)
+      return std::nullopt;
+    const unsigned RC = TTI->getRegisterClassForType(/*Vector=*/true, VecTy);
+    return std::make_pair(RC, Parts);
+  };
+
+  // Flat 1-register footprint for a surrounding scalar; priced into the
+  // vector/VGPR class since a divergent scalar needs a VGPR too.
+  auto GetScalarFootprint =
+      [&](const Instruction *I) -> std::pair<unsigned, unsigned> {
+    return {TTI->getRegisterClassForType(/*Vector=*/true, I->getType()), 1};
+  };
+
+  // Sweep in position order, tracking peak usage per class.
+  SmallDenseMap<unsigned, unsigned> PressureByClass;
+  SmallDenseMap<unsigned, std::pair<unsigned, unsigned>> OpenFootprint;
+  for (auto [Pos, Item] : enumerate(Items)) {
+    std::optional<std::pair<unsigned, unsigned>> RCParts =
+        Item.TE ? GetOwnFootprint(Item.TE)
+                : std::make_optional(GetScalarFootprint(Item.ScalarInst));
+    if (RCParts) {
+      OpenFootprint[Pos] = *RCParts;
+      PressureByClass[RCParts->first] += RCParts->second;
+    }
+    for (auto [RC, Usage] : PressureByClass)
+      MaxLocalUsers[RC] = std::max(MaxLocalUsers[RC], Usage);
+    for (unsigned Dead : DeathsAt[Pos]) {
+      auto It = OpenFootprint.find(Dead);
+      if (It == OpenFootprint.end())
+        continue;
+      PressureByClass[It->second.first] -= It->second.second;
+      OpenFootprint.erase(It);
+    }
+  }
+  return MaxLocalUsers;
 }
 
 /// Calculates a VectorInstrContext from the values in \p VL at indices in
@@ -19595,6 +19871,19 @@ BoUpSLP::calculateTreeCostAndTrimNonProfitable(ArrayRef<Value *> VectorizedVals,
         }
         ExtractCosts.try_emplace(&TE, ExtCost);
       }
+    }
+  }
+  // Fold tree-wide register-pressure spills into the cost (opt-in).
+  if (SLPConsiderRegisterPressure) {
+    for (auto [RegClass, Peak] : computeTreeRegisterPressure()) {
+      const unsigned Avail = TTI->getVectorRegisterBudgetForSLP(RegClass, *F);
+      if (Peak <= Avail)
+        continue;
+      const unsigned Spills = Peak - Avail;
+      InstructionCost SingleRegSpillReload =
+          TTI->getRegisterClassReloadCost(RegClass, CostKind) +
+          TTI->getRegisterClassSpillCost(RegClass, CostKind);
+      Cost += SingleRegSpillReload * Spills;
     }
   }
   // Bail out if the cost threshold is negative and cost already below it.
@@ -28941,8 +29230,9 @@ PreservedAnalyses SLPVectorizerPass::run(Function &F, FunctionAnalysisManager &A
   auto *AC = &AM.getResult<AssumptionAnalysis>(F);
   auto *DB = &AM.getResult<DemandedBitsAnalysis>(F);
   auto *ORE = &AM.getResult<OptimizationRemarkEmitterAnalysis>(F);
+  auto *UA = &AM.getResult<UniformityInfoAnalysis>(F);
 
-  bool Changed = runImpl(F, SE, TTI, TLI, AA, LI, DT, AC, DB, ORE);
+  bool Changed = runImpl(F, SE, TTI, TLI, AA, LI, DT, AC, DB, ORE, UA);
   if (!Changed)
     return PreservedAnalyses::all();
 
@@ -28962,7 +29252,8 @@ bool SLPVectorizerPass::runImpl(Function &F, ScalarEvolution *SE_,
                                 TargetLibraryInfo *TLI_, AAResults *AA_,
                                 LoopInfo *LI_, DominatorTree *DT_,
                                 AssumptionCache *AC_, DemandedBits *DB_,
-                                OptimizationRemarkEmitter *ORE_) {
+                                OptimizationRemarkEmitter *ORE_,
+                                const UniformityInfo *UA_) {
   if (!RunSLPVectorization)
     return false;
   SE = SE_;
@@ -28970,6 +29261,7 @@ bool SLPVectorizerPass::runImpl(Function &F, ScalarEvolution *SE_,
   TLI = TLI_;
   AA = AA_;
   LI = LI_;
+  UA = UA_;
   DT = DT_;
   AC = AC_;
   DB = DB_;
@@ -28995,7 +29287,7 @@ bool SLPVectorizerPass::runImpl(Function &F, ScalarEvolution *SE_,
 
   // Use the bottom up slp vectorizer to construct chains that start with
   // store instructions.
-  BoUpSLP R(&F, SE, TTI, TLI, AA, LI, DT, AC, DB, DL, ORE_);
+  BoUpSLP R(&F, SE, TTI, TLI, AA, LI, DT, AC, DB, DL, ORE_, UA);
 
   // A general note: the vectorizer must use BoUpSLP::eraseInstruction() to
   // delete instructions.

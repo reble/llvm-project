@@ -309,6 +309,15 @@ unsigned GCNTTIImpl::getNumberOfRegisters(unsigned RCID) const {
   return 4;
 }
 
+unsigned GCNTTIImpl::getVectorRegisterBudgetForSLP(unsigned RCID,
+                                                   const Function &F) const {
+  // Unlike getNumberOfRegisters(), which under-reports VGPRs to keep loop
+  // interleave selection conservative, SLP needs the real VGPR budget.
+  if (RCID == 0)
+    return getNumberOfRegisters(RCID);
+  return ST->getMaxNumVGPRs(F);
+}
+
 TypeSize
 GCNTTIImpl::getRegisterBitWidth(TargetTransformInfo::RegisterKind K) const {
   switch (K) {

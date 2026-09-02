@@ -129,6 +129,8 @@ public:
   }
 
   unsigned getNumberOfRegisters(unsigned RCID) const override;
+  unsigned getVectorRegisterBudgetForSLP(unsigned RCID,
+                                         const Function &F) const override;
   TypeSize
   getRegisterBitWidth(TargetTransformInfo::RegisterKind Vector) const override;
   unsigned getMinVectorRegisterBitWidth() const override;

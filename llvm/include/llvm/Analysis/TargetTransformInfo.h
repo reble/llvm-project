@@ -1358,6 +1358,12 @@ public:
   LLVM_ABI InstructionCost
   getRegisterClassReloadCost(unsigned ClassID, TargetCostKind CostKind) const;
 
+  /// \return an occupancy-aware register budget for SLP's pressure estimate,
+  /// distinct from getNumberOfRegisters() (which some targets under-report
+  /// to bias other heuristics). Defaults to getNumberOfRegisters().
+  LLVM_ABI unsigned getVectorRegisterBudgetForSLP(unsigned ClassID,
+                                                  const Function &F) const;
+
   enum RegisterKind { RGK_Scalar, RGK_FixedWidthVector, RGK_ScalableVector };
 
   /// \return The width of the largest scalar or vector register type.

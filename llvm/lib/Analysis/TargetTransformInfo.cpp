@@ -806,6 +806,12 @@ unsigned TargetTransformInfo::getNumberOfRegisters(unsigned ClassID) const {
   return TTIImpl->getNumberOfRegisters(ClassID);
 }
 
+unsigned
+TargetTransformInfo::getVectorRegisterBudgetForSLP(unsigned ClassID,
+                                                   const Function &F) const {
+  return TTIImpl->getVectorRegisterBudgetForSLP(ClassID, F);
+}
+
 bool TargetTransformInfo::hasConditionalLoadStoreForType(Type *Ty,
                                                          bool IsStore) const {
   return TTIImpl->hasConditionalLoadStoreForType(Ty, IsStore);
