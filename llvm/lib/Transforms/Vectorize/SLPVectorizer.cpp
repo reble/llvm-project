@@ -17156,7 +17156,12 @@ SmallDenseMap<unsigned, unsigned> BoUpSLP::computeTreeRegisterPressure() {
       auto UserPosIt = PosOf.find(Item.TE->UserTreeIndex.UserTE);
       if (UserPosIt == PosOf.end())
         continue;
-      DeathPos[Idx] = UserPosIt->second;
+      // A same-block PHI user (e.g. a loop-carried reduction phi) can sort
+      // before the operand it consumes, since phis always sort first in a
+      // block. Using that earlier position would kill this entry before
+      // its own birth, so only use it if it's actually after Idx.
+      if (UserPosIt->second > Idx)
+        DeathPos[Idx] = UserPosIt->second;
       continue;
     }
     if (Item.EscapesBB || !Item.LastLocalUser)
