@@ -81,17 +81,11 @@ private:
   // V_PK_FMA. Currently, only V_PK_MUL, V_PK_ADD, V_PK_FMA are supported for
   // this transformation.
   void performF32Unpacking(MachineInstr &I);
-  // Select corresponding unpacked instruction
-  uint32_t mapToUnpackedOpcode(MachineInstr &I);
   // Creates the unpacked instruction to be inserted. Adds source modifiers to
   // the unpacked instructions based on the source modifiers in the packed
   // instruction.
   MachineInstrBuilder createUnpackedMI(MachineInstr &I, uint32_t UnpackedOpcode,
                                        bool IsHiBits);
-  // Process operands/source modifiers from packed instructions and insert the
-  // appropriate source modifers and operands into the unpacked instructions.
-  void addOperandAndMods(MachineInstrBuilder &NewMI, unsigned SrcMods,
-                         bool IsHiBits, const MachineOperand &SrcMO);
 
 public:
   bool run(MachineFunction &MF, MachineLoopInfo *MLI);
@@ -653,82 +647,6 @@ bool SIPreEmitPeephole::canUnpackingClobberRegister(const MachineInstr &MI) {
   return false;
 }
 
-uint32_t SIPreEmitPeephole::mapToUnpackedOpcode(MachineInstr &I) {
-  unsigned Opcode = I.getOpcode();
-  // Use 64 bit encoding to allow use of VOP3 instructions.
-  // VOP3 e64 instructions allow source modifiers
-  // e32 instructions don't allow source modifiers.
-  switch (Opcode) {
-  case AMDGPU::V_PK_ADD_F32:
-  case AMDGPU::V_PK_ADD_F32_gfx1250:
-    return AMDGPU::V_ADD_F32_e64;
-  case AMDGPU::V_PK_MUL_F32:
-  case AMDGPU::V_PK_MUL_F32_gfx1250:
-    return AMDGPU::V_MUL_F32_e64;
-  case AMDGPU::V_PK_FMA_F32:
-  case AMDGPU::V_PK_FMA_F32_gfx1250:
-    return AMDGPU::V_FMA_F32_e64;
-  default:
-    return std::numeric_limits<uint32_t>::max();
-  }
-  llvm_unreachable("Fully covered switch");
-}
-
-void SIPreEmitPeephole::addOperandAndMods(MachineInstrBuilder &NewMI,
-                                          unsigned SrcMods, bool IsHiBits,
-                                          const MachineOperand &SrcMO) {
-  unsigned NewSrcMods = 0;
-  unsigned NegModifier = IsHiBits ? SISrcMods::NEG_HI : SISrcMods::NEG;
-  unsigned OpSelModifier = IsHiBits ? SISrcMods::OP_SEL_1 : SISrcMods::OP_SEL_0;
-  // Packed instructions (VOP3P) do not support ABS. Hence, no checks are done
-  // for ABS modifiers.
-  // If NEG or NEG_HI is true, we need to negate the corresponding 32 bit
-  // lane.
-  // NEG_HI shares the same bit position with ABS. But packed instructions do
-  // not support ABS. Therefore, NEG_HI must be translated to NEG source
-  // modifier for the higher 32 bits. Unpacked VOP3 instructions support
-  // ABS, but do not support NEG_HI. Therefore we need to explicitly add the
-  // NEG modifier if present in the packed instruction.
-  if (SrcMods & NegModifier)
-    NewSrcMods |= SISrcMods::NEG;
-  // Src modifiers. Only negative modifiers are added if needed. Unpacked
-  // operations do not have op_sel, therefore it must be handled explicitly as
-  // done below.
-  NewMI.addImm(NewSrcMods);
-  if (SrcMO.isImm()) {
-    NewMI.addImm(SrcMO.getImm());
-    return;
-  }
-  // If op_sel == 0, select register 0 of reg:sub0_sub1.
-  Register UnpackedSrcReg = (SrcMods & OpSelModifier)
-                                ? TRI->getSubReg(SrcMO.getReg(), AMDGPU::sub1)
-                                : TRI->getSubReg(SrcMO.getReg(), AMDGPU::sub0);
-
-  MachineOperand UnpackedSrcMO =
-      MachineOperand::CreateReg(UnpackedSrcReg, /*isDef=*/false);
-  if (SrcMO.isKill()) {
-    // For each unpacked instruction, mark its source registers as killed if the
-    // corresponding source register in the original packed instruction was
-    // marked as killed.
-    //
-    // Exception:
-    // If the op_sel and op_sel_hi modifiers require both unpacked instructions
-    // to use the same register (e.g., due to overlapping access to low/high
-    // bits of the same packed register), then only the *second* (latter)
-    // instruction should mark the register as killed. This is because the
-    // second instruction handles the higher bits and is effectively the last
-    // user of the full register pair.
-
-    bool OpSel = SrcMods & SISrcMods::OP_SEL_0;
-    bool OpSelHi = SrcMods & SISrcMods::OP_SEL_1;
-    bool KillState = true;
-    if ((OpSel == OpSelHi) && !IsHiBits)
-      KillState = false;
-    UnpackedSrcMO.setIsKill(KillState);
-  }
-  NewMI.add(UnpackedSrcMO);
-}
-
 void SIPreEmitPeephole::collectUnpackingCandidates(
     MachineInstr &BeginMI, SetVector<MachineInstr *> &InstrsToUnpack,
     uint16_t NumMFMACycles) {
@@ -740,7 +658,8 @@ void SIPreEmitPeephole::collectUnpackingCandidates(
 
   for (auto I = std::next(BeginMI.getIterator()); I != E; ++I) {
     MachineInstr &Instr = *I;
-    uint32_t UnpackedOpCode = mapToUnpackedOpcode(Instr);
+    uint32_t UnpackedOpCode =
+        SIInstrInfo::mapToUnpackedOpcode(Instr.getOpcode());
     bool IsUnpackable =
         !(UnpackedOpCode == std::numeric_limits<uint32_t>::max());
     if (Instr.isMetaInstruction())
@@ -790,7 +709,7 @@ void SIPreEmitPeephole::collectUnpackingCandidates(
 void SIPreEmitPeephole::performF32Unpacking(MachineInstr &I) {
   const MachineOperand &DstOp = I.getOperand(0);
 
-  uint32_t UnpackedOpcode = mapToUnpackedOpcode(I);
+  uint32_t UnpackedOpcode = SIInstrInfo::mapToUnpackedOpcode(I.getOpcode());
   assert(UnpackedOpcode != std::numeric_limits<uint32_t>::max() &&
          "Unsupported Opcode");
 
@@ -833,15 +752,15 @@ MachineInstrBuilder SIPreEmitPeephole::createUnpackedMI(MachineInstr &I,
 
   MachineInstrBuilder NewMI = BuildMI(MBB, I, DL, TII->get(UnpackedOpcode));
   NewMI.addDef(UnpackedDstReg); // vdst
-  addOperandAndMods(NewMI, Src0Mods, IsHiBits, *SrcMO0);
-  addOperandAndMods(NewMI, Src1Mods, IsHiBits, *SrcMO1);
+  TII->addUnpackedOperandAndMods(NewMI, Src0Mods, IsHiBits, *SrcMO0);
+  TII->addUnpackedOperandAndMods(NewMI, Src1Mods, IsHiBits, *SrcMO1);
 
   if (AMDGPU::hasNamedOperand(OpCode, AMDGPU::OpName::src2)) {
     const MachineOperand *SrcMO2 =
         TII->getNamedOperand(I, AMDGPU::OpName::src2);
     unsigned Src2Mods =
         TII->getNamedOperand(I, AMDGPU::OpName::src2_modifiers)->getImm();
-    addOperandAndMods(NewMI, Src2Mods, IsHiBits, *SrcMO2);
+    TII->addUnpackedOperandAndMods(NewMI, Src2Mods, IsHiBits, *SrcMO2);
   }
   NewMI.addImm(ClampVal); // clamp
   // Packed instructions do not support output modifiers. safe to assign them 0

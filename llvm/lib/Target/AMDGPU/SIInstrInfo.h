@@ -1379,6 +1379,27 @@ public:
 
   bool isNeverCoissue(MachineInstr &MI) const;
 
+  /// Map a packed VOP3P F32 opcode to the equivalent unpacked VOP3 (e64)
+  /// opcode. The e64 form is used because, unlike e32, it can carry the source
+  /// modifiers that the packed form may have.
+  ///
+  /// Returns std::numeric_limits<uint32_t>::max() if \p Opcode has no unpacked
+  /// equivalent.
+  static uint32_t mapToUnpackedOpcode(unsigned Opcode);
+
+  /// Append to \p NewMI the source-modifier immediate and the operand
+  /// corresponding to one 32-bit lane of the packed operand \p SrcMO, where
+  /// \p SrcMods are the packed instruction's modifiers for that operand.
+  /// \p IsHiBits selects the high lane.
+  ///
+  /// This translates the VOP3P modifier encoding into the VOP3 one: op_sel /
+  /// op_sel_hi become an explicit sub0/sub1 subregister choice, and neg /
+  /// neg_hi both become a plain NEG (VOP3P has no ABS, and NEG_HI shares its
+  /// bit position with ABS, so it must be re-expressed for the unpacked form).
+  void addUnpackedOperandAndMods(MachineInstrBuilder &NewMI, unsigned SrcMods,
+                                 bool IsHiBits,
+                                 const MachineOperand &SrcMO) const;
+
   /// Check if this immediate value can be used for AV_MOV_B64_IMM_PSEUDO.
   bool isLegalAV64PseudoImm(uint64_t Imm) const;
 

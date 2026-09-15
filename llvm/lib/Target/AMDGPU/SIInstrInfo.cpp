@@ -6880,6 +6880,81 @@ bool SIInstrInfo::isNeverCoissue(MachineInstr &MI) const {
   }
 }
 
+uint32_t SIInstrInfo::mapToUnpackedOpcode(unsigned Opcode) {
+  // Use 64 bit encoding to allow use of VOP3 instructions.
+  // VOP3 e64 instructions allow source modifiers
+  // e32 instructions don't allow source modifiers.
+  switch (Opcode) {
+  case AMDGPU::V_PK_ADD_F32:
+  case AMDGPU::V_PK_ADD_F32_gfx1250:
+    return AMDGPU::V_ADD_F32_e64;
+  case AMDGPU::V_PK_MUL_F32:
+  case AMDGPU::V_PK_MUL_F32_gfx1250:
+    return AMDGPU::V_MUL_F32_e64;
+  case AMDGPU::V_PK_FMA_F32:
+  case AMDGPU::V_PK_FMA_F32_gfx1250:
+    return AMDGPU::V_FMA_F32_e64;
+  default:
+    return std::numeric_limits<uint32_t>::max();
+  }
+  llvm_unreachable("Fully covered switch");
+}
+
+void SIInstrInfo::addUnpackedOperandAndMods(MachineInstrBuilder &NewMI,
+                                            unsigned SrcMods, bool IsHiBits,
+                                            const MachineOperand &SrcMO) const {
+  unsigned NewSrcMods = 0;
+  unsigned NegModifier = IsHiBits ? SISrcMods::NEG_HI : SISrcMods::NEG;
+  unsigned OpSelModifier = IsHiBits ? SISrcMods::OP_SEL_1 : SISrcMods::OP_SEL_0;
+  // Packed instructions (VOP3P) do not support ABS. Hence, no checks are done
+  // for ABS modifiers.
+  // If NEG or NEG_HI is true, we need to negate the corresponding 32 bit
+  // lane.
+  // NEG_HI shares the same bit position with ABS. But packed instructions do
+  // not support ABS. Therefore, NEG_HI must be translated to NEG source
+  // modifier for the higher 32 bits. Unpacked VOP3 instructions support
+  // ABS, but do not support NEG_HI. Therefore we need to explicitly add the
+  // NEG modifier if present in the packed instruction.
+  if (SrcMods & NegModifier)
+    NewSrcMods |= SISrcMods::NEG;
+  // Src modifiers. Only negative modifiers are added if needed. Unpacked
+  // operations do not have op_sel, therefore it must be handled explicitly as
+  // done below.
+  NewMI.addImm(NewSrcMods);
+  if (SrcMO.isImm()) {
+    NewMI.addImm(SrcMO.getImm());
+    return;
+  }
+  // If op_sel == 0, select register 0 of reg:sub0_sub1.
+  Register UnpackedSrcReg = (SrcMods & OpSelModifier)
+                                ? RI.getSubReg(SrcMO.getReg(), AMDGPU::sub1)
+                                : RI.getSubReg(SrcMO.getReg(), AMDGPU::sub0);
+
+  MachineOperand UnpackedSrcMO =
+      MachineOperand::CreateReg(UnpackedSrcReg, /*isDef=*/false);
+  if (SrcMO.isKill()) {
+    // For each unpacked instruction, mark its source registers as killed if the
+    // corresponding source register in the original packed instruction was
+    // marked as killed.
+    //
+    // Exception:
+    // If the op_sel and op_sel_hi modifiers require both unpacked instructions
+    // to use the same register (e.g., due to overlapping access to low/high
+    // bits of the same packed register), then only the *second* (latter)
+    // instruction should mark the register as killed. This is because the
+    // second instruction handles the higher bits and is effectively the last
+    // user of the full register pair.
+
+    bool OpSel = SrcMods & SISrcMods::OP_SEL_0;
+    bool OpSelHi = SrcMods & SISrcMods::OP_SEL_1;
+    bool KillState = true;
+    if ((OpSel == OpSelHi) && !IsHiBits)
+      KillState = false;
+    UnpackedSrcMO.setIsKill(KillState);
+  }
+  NewMI.add(UnpackedSrcMO);
+}
+
 void SIInstrInfo::legalizeOperandsVOP2(MachineRegisterInfo &MRI,
                                        MachineInstr &MI) const {
   unsigned Opc = MI.getOpcode();
